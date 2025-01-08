@@ -1,9 +1,7 @@
 package mem
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/glog"
 	"sync"
-	"sync/atomic"
 )
 
 var pools []*sync.Pool
@@ -33,22 +31,24 @@ func init() {
 	}
 }
 
-func getSlotPool(size int) *sync.Pool {
+func getSlotPool(size int) (*sync.Pool, bool) {
 	index := bitCount(size)
-	return pools[index]
+	if index >= len(pools) {
+		return nil, false
+	}
+	return pools[index], true
 }
 
-var total int64
-
 func Allocate(size int) []byte {
-	newVal := atomic.AddInt64(&total, 1)
-	glog.V(4).Infof("++> %d", newVal)
-	slab := *getSlotPool(size).Get().(*[]byte)
-	return slab[:size]
+	if pool, found := getSlotPool(size); found {
+		slab := *pool.Get().(*[]byte)
+		return slab[:size]
+	}
+	return make([]byte, size)
 }
 
 func Free(buf []byte) {
-	newVal := atomic.AddInt64(&total, -1)
-	glog.V(4).Infof("--> %d", newVal)
-	getSlotPool(cap(buf)).Put(&buf)
+	if pool, found := getSlotPool(cap(buf)); found {
+		pool.Put(&buf)
+	}
 }

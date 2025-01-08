@@ -47,19 +47,36 @@ type Filter struct {
 
 // Prefix holds the prefix xml tag in <Rule> and <Filter>
 type Prefix struct {
-	string
-	set bool
+	XMLName xml.Name `xml:"Prefix"`
+	set     bool
+
+	val string
 }
 
-// MarshalXML - decodes XML data.
+func (p Prefix) String() string {
+	return p.val
+}
+
+// MarshalXML encodes Prefix field into an XML form.
 func (p Prefix) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
 	if !p.set {
 		return nil
 	}
-	return e.EncodeElement(p.string, startElement)
+	return e.EncodeElement(p.val, startElement)
 }
 
+func (p *Prefix) UnmarshalXML(d *xml.Decoder, startElement xml.StartElement) error {
+	prefix := ""
+	_ = d.DecodeElement(&prefix, &startElement)
+	*p = Prefix{set: true, val: prefix}
+	return nil
+}
+
+// MarshalXML encodes Filter field into an XML form.
 func (f Filter) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if !f.set {
+		return nil
+	}
 	if err := e.EncodeToken(start); err != nil {
 		return err
 	}

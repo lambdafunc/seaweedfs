@@ -4,16 +4,17 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 )
 
 var ErrorOutOfBounds = errors.New("attempt to read out of bounds")
 
 type ChunkCache interface {
-	GetChunk(fileId string, minSize uint64) (data []byte)
-	GetChunkSlice(fileId string, offset, length uint64) []byte
+	ReadChunkAt(data []byte, fileId string, offset uint64) (n int, err error)
 	SetChunk(fileId string, data []byte)
+	IsInCache(fileId string, lockNeeded bool) (answer bool)
+	GetMaxFilePartSizeInCache() (answer uint64)
 }
 
 // a global cache for recently accessed file chunks
@@ -21,9 +22,10 @@ type TieredChunkCache struct {
 	memCache   *ChunkCacheInMemory
 	diskCaches []*OnDiskCacheLayer
 	sync.RWMutex
-	onDiskCacheSizeLimit0 uint64
-	onDiskCacheSizeLimit1 uint64
-	onDiskCacheSizeLimit2 uint64
+	onDiskCacheSizeLimit0  uint64
+	onDiskCacheSizeLimit1  uint64
+	onDiskCacheSizeLimit2  uint64
+	maxFilePartSizeInCache uint64
 }
 
 var _ ChunkCache = &TieredChunkCache{}
@@ -40,109 +42,98 @@ func NewTieredChunkCache(maxEntries int64, dir string, diskSizeInUnit int64, uni
 	c.diskCaches[0] = NewOnDiskCacheLayer(dir, "c0_2", diskSizeInUnit*unitSize/8, 2)
 	c.diskCaches[1] = NewOnDiskCacheLayer(dir, "c1_3", diskSizeInUnit*unitSize/4+diskSizeInUnit*unitSize/8, 3)
 	c.diskCaches[2] = NewOnDiskCacheLayer(dir, "c2_2", diskSizeInUnit*unitSize/2, 2)
+	c.maxFilePartSizeInCache = uint64(unitSize*diskSizeInUnit) / 4
 
 	return c
 }
 
-func (c *TieredChunkCache) GetChunk(fileId string, minSize uint64) (data []byte) {
+func (c *TieredChunkCache) GetMaxFilePartSizeInCache() (answer uint64) {
 	if c == nil {
-		return
+		return 0
 	}
-
-	c.RLock()
-	defer c.RUnlock()
-
-	return c.doGetChunk(fileId, minSize)
+	return c.maxFilePartSizeInCache
 }
 
-func (c *TieredChunkCache) doGetChunk(fileId string, minSize uint64) (data []byte) {
+func (c *TieredChunkCache) IsInCache(fileId string, lockNeeded bool) (answer bool) {
+	if c == nil {
+		return false
+	}
 
-	if minSize <= c.onDiskCacheSizeLimit0 {
-		data = c.memCache.GetChunk(fileId)
-		if len(data) >= int(minSize) {
-			return data
-		}
+	if lockNeeded {
+		c.RLock()
+		defer c.RUnlock()
+	}
+
+	item := c.memCache.cache.Get(fileId)
+	if item != nil {
+		glog.V(4).Infof("fileId %s is in memcache", fileId)
+		return true
 	}
 
 	fid, err := needle.ParseFileIdFromString(fileId)
 	if err != nil {
-		glog.Errorf("failed to parse file id %s", fileId)
-		return nil
+		glog.V(4).Infof("failed to parse file id %s", fileId)
+		return false
 	}
 
-	if minSize <= c.onDiskCacheSizeLimit0 {
-		data = c.diskCaches[0].getChunk(fid.Key)
-		if len(data) >= int(minSize) {
-			return data
+	for i, diskCacheLayer := range c.diskCaches {
+		for k, v := range diskCacheLayer.diskCaches {
+			_, ok := v.nm.Get(fid.Key)
+			if ok {
+				glog.V(4).Infof("fileId %s is in diskCaches[%d].volume[%d]", fileId, i, k)
+				return true
+			}
 		}
 	}
-	if minSize <= c.onDiskCacheSizeLimit1 {
-		data = c.diskCaches[1].getChunk(fid.Key)
-		if len(data) >= int(minSize) {
-			return data
-		}
-	}
-	{
-		data = c.diskCaches[2].getChunk(fid.Key)
-		if len(data) >= int(minSize) {
-			return data
-		}
-	}
-
-	return nil
-
+	return false
 }
 
-func (c *TieredChunkCache) GetChunkSlice(fileId string, offset, length uint64) []byte {
+func (c *TieredChunkCache) ReadChunkAt(data []byte, fileId string, offset uint64) (n int, err error) {
 	if c == nil {
-		return nil
+		return 0, nil
 	}
 
 	c.RLock()
 	defer c.RUnlock()
 
-	return c.doGetChunkSlice(fileId, offset, length)
-}
-
-func (c *TieredChunkCache) doGetChunkSlice(fileId string, offset, length uint64) (data []byte) {
-
-	minSize := offset + length
+	minSize := offset + uint64(len(data))
 	if minSize <= c.onDiskCacheSizeLimit0 {
-		data, err := c.memCache.getChunkSlice(fileId, offset, length)
+		n, err = c.memCache.readChunkAt(data, fileId, offset)
 		if err != nil {
 			glog.Errorf("failed to read from memcache: %s", err)
 		}
-		if len(data) >= int(minSize) {
-			return data
+		if n == int(len(data)) {
+			return n, nil
 		}
 	}
 
 	fid, err := needle.ParseFileIdFromString(fileId)
 	if err != nil {
 		glog.Errorf("failed to parse file id %s", fileId)
-		return nil
+		return 0, nil
 	}
 
 	if minSize <= c.onDiskCacheSizeLimit0 {
-		data = c.diskCaches[0].getChunkSlice(fid.Key, offset, length)
-		if len(data) >= int(minSize) {
-			return data
+		n, err = c.diskCaches[0].readChunkAt(data, fid.Key, offset)
+		if n == int(len(data)) {
+			return
 		}
 	}
 	if minSize <= c.onDiskCacheSizeLimit1 {
-		data = c.diskCaches[1].getChunkSlice(fid.Key, offset, length)
-		if len(data) >= int(minSize) {
-			return data
+		n, err = c.diskCaches[1].readChunkAt(data, fid.Key, offset)
+		if n == int(len(data)) {
+			return
 		}
 	}
 	{
-		data = c.diskCaches[2].getChunkSlice(fid.Key, offset, length)
-		if len(data) >= int(minSize) {
-			return data
+		n, err = c.diskCaches[2].readChunkAt(data, fid.Key, offset)
+		if n == int(len(data)) {
+			return
 		}
 	}
 
-	return nil
+	return 0, nil
+
 }
 
 func (c *TieredChunkCache) SetChunk(fileId string, data []byte) {
@@ -153,6 +144,10 @@ func (c *TieredChunkCache) SetChunk(fileId string, data []byte) {
 	defer c.Unlock()
 
 	glog.V(4).Infof("SetChunk %s size %d\n", fileId, len(data))
+	if c.IsInCache(fileId, false) {
+		glog.V(4).Infof("fileId %s is already in cache", fileId)
+		return
+	}
 
 	c.doSetChunk(fileId, data)
 }

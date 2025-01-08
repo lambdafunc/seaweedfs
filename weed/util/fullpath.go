@@ -1,7 +1,6 @@
 package util
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -30,6 +29,13 @@ func (fp FullPath) Name() string {
 	return name
 }
 
+func (fp FullPath) IsLongerFileName(maxFilenameLength uint32) bool {
+	if maxFilenameLength == 0 {
+		return false
+	}
+	return uint32(len([]byte(fp.Name()))) > maxFilenameLength
+}
+
 func (fp FullPath) Child(name string) FullPath {
 	dir := string(fp)
 	noPrefix := name
@@ -43,29 +49,9 @@ func (fp FullPath) Child(name string) FullPath {
 }
 
 // AsInode an in-memory only inode representation
-func (fp FullPath) AsInode(fileMode os.FileMode) uint64 {
+func (fp FullPath) AsInode(unixTime int64) uint64 {
 	inode := uint64(HashStringToLong(string(fp)))
-	inode = inode - inode%16
-	if fileMode == 0 {
-	} else if fileMode&os.ModeDir > 0 {
-		inode += 1
-	} else if fileMode&os.ModeSymlink > 0 {
-		inode += 2
-	} else if fileMode&os.ModeDevice > 0 {
-		if fileMode&os.ModeCharDevice > 0 {
-			inode += 6
-		} else {
-			inode += 3
-		}
-	} else if fileMode&os.ModeNamedPipe > 0 {
-		inode += 4
-	} else if fileMode&os.ModeSocket > 0 {
-		inode += 5
-	} else if fileMode&os.ModeCharDevice > 0 {
-		inode += 6
-	} else if fileMode&os.ModeIrregular > 0 {
-		inode += 7
-	}
+	inode = inode + uint64(unixTime)*37
 	return inode
 }
 
@@ -83,4 +69,18 @@ func Join(names ...string) string {
 
 func JoinPath(names ...string) FullPath {
 	return FullPath(Join(names...))
+}
+
+func (fp FullPath) IsUnder(other FullPath) bool {
+	if other == "/" {
+		return true
+	}
+	return strings.HasPrefix(string(fp), string(other)+"/")
+}
+
+func StringSplit(separatedValues string, sep string) []string {
+	if separatedValues == "" {
+		return nil
+	}
+	return strings.Split(separatedValues, sep)
 }

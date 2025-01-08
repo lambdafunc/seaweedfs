@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -30,10 +31,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 )
 
 func (iam *IdentityAccessManagement) reqSignatureV4Verify(r *http.Request) (*Identity, s3err.ErrorCode) {
@@ -145,28 +148,49 @@ func (iam *IdentityAccessManagement) doesSignatureMatch(hashedPayload string, r 
 		}
 	}
 
+	if forwardedPrefix := r.Header.Get("X-Forwarded-Prefix"); forwardedPrefix != "" {
+		// Handling usage of reverse proxy at prefix.
+		// Trying with prefix before main path.
+
+		// Get canonical request.
+		canonicalRequest := getCanonicalRequest(extractedSignedHeaders, hashedPayload, queryStr, forwardedPrefix+req.URL.Path, req.Method)
+
+		errCode = iam.genAndCompareSignatureV4(canonicalRequest, cred.SecretKey, t, signV4Values)
+		if errCode == s3err.ErrNone {
+			return identity, errCode
+		}
+	}
+
 	// Get canonical request.
 	canonicalRequest := getCanonicalRequest(extractedSignedHeaders, hashedPayload, queryStr, req.URL.Path, req.Method)
 
+	errCode = iam.genAndCompareSignatureV4(canonicalRequest, cred.SecretKey, t, signV4Values)
+
+	if errCode == s3err.ErrNone {
+		return identity, errCode
+	}
+	return nil, errCode
+}
+
+// Generate and compare signature for request.
+func (iam *IdentityAccessManagement) genAndCompareSignatureV4(canonicalRequest, secretKey string, t time.Time, signV4Values signValues) s3err.ErrorCode {
 	// Get string to sign from canonical request.
 	stringToSign := getStringToSign(canonicalRequest, t, signV4Values.Credential.getScope())
 
-	// Get hmac signing key.
-	signingKey := getSigningKey(cred.SecretKey,
+	// Calculate signature.
+	newSignature := iam.getSignature(
+		secretKey,
 		signV4Values.Credential.scope.date,
 		signV4Values.Credential.scope.region,
-		signV4Values.Credential.scope.service)
-
-	// Calculate signature.
-	newSignature := getSignature(signingKey, stringToSign)
+		signV4Values.Credential.scope.service,
+		stringToSign,
+	)
 
 	// Verify if signature match.
 	if !compareSignatureV4(newSignature, signV4Values.Signature) {
-		return nil, s3err.ErrSignatureDoesNotMatch
+		return s3err.ErrSignatureDoesNotMatch
 	}
-
-	// Return error none.
-	return identity, s3err.ErrNone
+	return s3err.ErrNone
 }
 
 // credentialHeader data type represents structured form of Credential
@@ -198,9 +222,8 @@ func (c credentialHeader) getScope() string {
 	}, "/")
 }
 
-//    Authorization: algorithm Credential=accessKeyID/credScope, \
-//            SignedHeaders=signedHeaders, Signature=signature
-//
+//	Authorization: algorithm Credential=accessKeyID/credScope, \
+//	        SignedHeaders=signedHeaders, Signature=signature
 func parseSignV4(v4Auth string) (sv signValues, aec s3err.ErrorCode) {
 	// Replace all spaced strings, some clients can send spaced
 	// parameters and some won't. So we pro-actively remove any spaces
@@ -226,7 +249,7 @@ func parseSignV4(v4Auth string) (sv signValues, aec s3err.ErrorCode) {
 	signV4Values := signValues{}
 
 	var err s3err.ErrorCode
-	// Save credentail values.
+	// Save credential values.
 	signV4Values.Credential, err = parseCredentialHeader(authFields[0])
 	if err != s3err.ErrNone {
 		return sv, err
@@ -309,8 +332,9 @@ func parseSignature(signElement string) (string, s3err.ErrorCode) {
 	return signature, s3err.ErrNone
 }
 
-// doesPolicySignatureMatch - Verify query headers with post policy
-//     - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+// doesPolicySignatureV4Match - Verify query headers with post policy
+//   - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+//
 // returns ErrNone if the signature matches.
 func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.Header) s3err.ErrorCode {
 
@@ -325,11 +349,14 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.
 		return s3err.ErrInvalidAccessKeyID
 	}
 
-	// Get signing key.
-	signingKey := getSigningKey(cred.SecretKey, credHeader.scope.date, credHeader.scope.region, credHeader.scope.service)
-
 	// Get signature.
-	newSignature := getSignature(signingKey, formValues.Get("Policy"))
+	newSignature := iam.getSignature(
+		cred.SecretKey,
+		credHeader.scope.date,
+		credHeader.scope.region,
+		credHeader.scope.service,
+		formValues.Get("Policy"),
+	)
 
 	// Verify signature.
 	if !compareSignatureV4(newSignature, formValues.Get("X-Amz-Signature")) {
@@ -341,7 +368,7 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.
 }
 
 // check query headers with presigned signature
-//  - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+//   - http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
 func (iam *IdentityAccessManagement) doesPresignedSignatureMatch(hashedPayload string, r *http.Request) (*Identity, s3err.ErrorCode) {
 
 	// Copy request
@@ -442,20 +469,83 @@ func (iam *IdentityAccessManagement) doesPresignedSignatureMatch(hashedPayload s
 	// Get string to sign from canonical request.
 	presignedStringToSign := getStringToSign(presignedCanonicalReq, t, pSignValues.Credential.getScope())
 
-	// Get hmac presigned signing key.
-	presignedSigningKey := getSigningKey(cred.SecretKey,
+	// Get new signature.
+	newSignature := iam.getSignature(
+		cred.SecretKey,
 		pSignValues.Credential.scope.date,
 		pSignValues.Credential.scope.region,
-		pSignValues.Credential.scope.service)
-
-	// Get new signature.
-	newSignature := getSignature(presignedSigningKey, presignedStringToSign)
+		pSignValues.Credential.scope.service,
+		presignedStringToSign,
+	)
 
 	// Verify signature.
 	if !compareSignatureV4(req.URL.Query().Get("X-Amz-Signature"), newSignature) {
 		return nil, s3err.ErrSignatureDoesNotMatch
 	}
 	return identity, s3err.ErrNone
+}
+
+func (iam *IdentityAccessManagement) getSignature(secretKey string, t time.Time, region string, service string, stringToSign string) string {
+	pool := iam.getSignatureHashPool(secretKey, t, region, service)
+	h := pool.Get().(hash.Hash)
+	defer pool.Put(h)
+
+	h.Reset()
+	h.Write([]byte(stringToSign))
+	sig := hex.EncodeToString(h.Sum(nil))
+
+	return sig
+}
+
+func (iam *IdentityAccessManagement) getSignatureHashPool(secretKey string, t time.Time, region string, service string) *sync.Pool {
+	// Build a caching key for the pool.
+	date := t.Format(yyyymmdd)
+	hashID := "AWS4" + secretKey + "/" + date + "/" + region + "/" + service + "/" + "aws4_request"
+
+	// Try to find an existing pool and return it.
+	iam.hashMu.RLock()
+	pool, ok := iam.hashes[hashID]
+	iam.hashMu.RUnlock()
+
+	if !ok {
+		iam.hashMu.Lock()
+		defer iam.hashMu.Unlock()
+		pool, ok = iam.hashes[hashID]
+	}
+
+	if ok {
+		atomic.StoreInt32(iam.hashCounters[hashID], 1)
+		return pool
+	}
+
+	// Create a pool that returns HMAC hashers for the requested parameters to avoid expensive re-initializing
+	// of new instances on every request.
+	iam.hashes[hashID] = &sync.Pool{
+		New: func() any {
+			signingKey := getSigningKey(secretKey, date, region, service)
+			return hmac.New(sha256.New, signingKey)
+		},
+	}
+	iam.hashCounters[hashID] = new(int32)
+
+	// Clean up unused pools automatically after one hour of inactivity
+	ticker := time.NewTicker(time.Hour)
+	go func() {
+		for range ticker.C {
+			old := atomic.SwapInt32(iam.hashCounters[hashID], 0)
+			if old == 0 {
+				break
+			}
+		}
+
+		ticker.Stop()
+		iam.hashMu.Lock()
+		delete(iam.hashes, hashID)
+		delete(iam.hashCounters, hashID)
+		iam.hashMu.Unlock()
+	}()
+
+	return iam.hashes[hashID]
 }
 
 func contains(list []string, elem string) bool {
@@ -467,7 +557,7 @@ func contains(list []string, elem string) bool {
 	return false
 }
 
-// preSignValues data type represents structued form of AWS Signature V4 query string.
+// preSignValues data type represents structured form of AWS Signature V4 query string.
 type preSignValues struct {
 	signValues
 	Date    time.Time
@@ -476,12 +566,12 @@ type preSignValues struct {
 
 // Parses signature version '4' query string of the following form.
 //
-//   querystring = X-Amz-Algorithm=algorithm
-//   querystring += &X-Amz-Credential= urlencode(accessKey + '/' + credential_scope)
-//   querystring += &X-Amz-Date=date
-//   querystring += &X-Amz-Expires=timeout interval
-//   querystring += &X-Amz-SignedHeaders=signed_headers
-//   querystring += &X-Amz-Signature=signature
+//	querystring = X-Amz-Algorithm=algorithm
+//	querystring += &X-Amz-Credential= urlencode(accessKey + '/' + credential_scope)
+//	querystring += &X-Amz-Date=date
+//	querystring += &X-Amz-Expires=timeout interval
+//	querystring += &X-Amz-SignedHeaders=signed_headers
+//	querystring += &X-Amz-Signature=signature
 //
 // verifies if any of the necessary query params are missing in the presigned request.
 func doesV4PresignParamsExist(query url.Values) s3err.ErrorCode {
@@ -551,7 +641,7 @@ func parsePreSignV4(query url.Values) (psv preSignValues, aec s3err.ErrorCode) {
 		return psv, err
 	}
 
-	// Return structed form of signature query string.
+	// Return structured form of signature query string.
 	return preSignV4Values, s3err.ErrNone
 }
 
@@ -576,9 +666,10 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request) (http.Header,
 		}
 		switch header {
 		case "expect":
-			// Golang http server strips off 'Expect' header, if the
-			// client sent this as part of signed headers we need to
-			// handle otherwise we would see a signature mismatch.
+			// Set the default value of the Expect header for compatibility.
+			//
+			// In NGINX v1.1, the Expect header is removed when handling 100-continue requests.
+			//
 			// `aws-cli` sets this as part of signed headers.
 			//
 			// According to
@@ -590,12 +681,14 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request) (http.Header,
 			//
 			// So it safe to assume that '100-continue' is what would
 			// be sent, for the time being keep this work around.
-			// Adding a *TODO* to remove this later when Golang server
-			// doesn't filter out the 'Expect' header.
 			extractedSignedHeaders.Set(header, "100-continue")
 		case "host":
 			// Go http server removes "host" from Request.Header
-			extractedSignedHeaders.Set(header, r.Host)
+			if forwardedHost := r.Header.Get("X-Forwarded-Host"); forwardedHost != "" {
+				extractedSignedHeaders.Set(header, forwardedHost)
+			} else {
+				extractedSignedHeaders.Set(header, r.Host)
+			}
 		case "transfer-encoding":
 			for _, enc := range r.TransferEncoding {
 				extractedSignedHeaders.Add(header, enc)
@@ -636,13 +729,13 @@ func getScope(t time.Time, region string) string {
 // getCanonicalRequest generate a canonical request of style
 //
 // canonicalRequest =
-//  <HTTPMethod>\n
-//  <CanonicalURI>\n
-//  <CanonicalQueryString>\n
-//  <CanonicalHeaders>\n
-//  <SignedHeaders>\n
-//  <HashedPayload>
 //
+//	<HTTPMethod>\n
+//	<CanonicalURI>\n
+//	<CanonicalQueryString>\n
+//	<CanonicalHeaders>\n
+//	<SignedHeaders>\n
+//	<HashedPayload>
 func getCanonicalRequest(extractedSignedHeaders http.Header, payload, queryStr, urlPath, method string) string {
 	rawQuery := strings.Replace(queryStr, "+", "%20", -1)
 	encodedPath := encodePath(urlPath)
@@ -674,17 +767,12 @@ func sumHMAC(key []byte, data []byte) []byte {
 }
 
 // getSigningKey hmac seed to calculate final signature.
-func getSigningKey(secretKey string, t time.Time, region string, service string) []byte {
-	date := sumHMAC([]byte("AWS4"+secretKey), []byte(t.Format(yyyymmdd)))
+func getSigningKey(secretKey string, time string, region string, service string) []byte {
+	date := sumHMAC([]byte("AWS4"+secretKey), []byte(time))
 	regionBytes := sumHMAC(date, []byte(region))
 	serviceBytes := sumHMAC(regionBytes, []byte(service))
 	signingKey := sumHMAC(serviceBytes, []byte("aws4_request"))
 	return signingKey
-}
-
-// getSignature final signature in hexadecimal form.
-func getSignature(signingKey []byte, stringToSign string) string {
-	return hex.EncodeToString(sumHMAC(signingKey, []byte(stringToSign)))
 }
 
 // getCanonicalHeaders generate a list of request headers with their values

@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"io"
 	"math"
 )
@@ -29,6 +29,10 @@ func (c *commandS3BucketQuotaEnforce) Help() string {
 `
 }
 
+func (c *commandS3BucketQuotaEnforce) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -36,6 +40,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 	if err = bucketCommand.Parse(args); err != nil {
 		return nil
 	}
+	infoAboutSimulationMode(writer, *applyQuotaLimit, "-apply")
 
 	// collect collection information
 	topologyInfo, _, err := collectTopologyInfo(commandEnv, 0)
@@ -64,8 +69,8 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 		if !entry.IsDirectory {
 			return nil
 		}
-		collection := entry.Name
-		var collectionSize uint64
+		collection := getCollectionName(commandEnv, entry.Name)
+		var collectionSize float64
 		if collectionInfo, found := collectionInfos[collection]; found {
 			collectionSize = collectionInfo.Size
 		}
@@ -95,7 +100,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 
 }
 
-func (c *commandS3BucketQuotaEnforce) processEachBucket(fc *filer.FilerConf, filerBucketsPath string, entry *filer_pb.Entry, writer io.Writer, collectionSize uint64) (hasConfChanges bool) {
+func (c *commandS3BucketQuotaEnforce) processEachBucket(fc *filer.FilerConf, filerBucketsPath string, entry *filer_pb.Entry, writer io.Writer, collectionSize float64) (hasConfChanges bool) {
 
 	locPrefix := filerBucketsPath + "/" + entry.Name + "/"
 	locConf := fc.MatchStorageRule(locPrefix)
@@ -103,12 +108,12 @@ func (c *commandS3BucketQuotaEnforce) processEachBucket(fc *filer.FilerConf, fil
 
 	if entry.Quota > 0 {
 		if locConf.ReadOnly {
-			if collectionSize < uint64(entry.Quota) {
+			if collectionSize < float64(entry.Quota) {
 				locConf.ReadOnly = false
 				hasConfChanges = true
 			}
 		} else {
-			if collectionSize > uint64(entry.Quota) {
+			if collectionSize > float64(entry.Quota) {
 				locConf.ReadOnly = true
 				hasConfChanges = true
 			}
@@ -121,15 +126,15 @@ func (c *commandS3BucketQuotaEnforce) processEachBucket(fc *filer.FilerConf, fil
 	}
 
 	if hasConfChanges {
-		fmt.Fprintf(writer, "  %s\tsize:%d", entry.Name, collectionSize)
-		fmt.Fprintf(writer, "\tquota:%d\tusage:%.2f%%", entry.Quota, float64(collectionSize)*100/float64(entry.Quota))
+		fmt.Fprintf(writer, "  %s\tsize:%.0f", entry.Name, collectionSize)
+		fmt.Fprintf(writer, "\tquota:%d\tusage:%.2f%%", entry.Quota, collectionSize*100/float64(entry.Quota))
 		fmt.Fprintln(writer)
 		if locConf.ReadOnly {
 			fmt.Fprintf(writer, "    changing bucket %s to read only!\n", entry.Name)
 		} else {
 			fmt.Fprintf(writer, "    changing bucket %s to writable.\n", entry.Name)
 		}
-		fc.AddLocationConf(locConf)
+		fc.SetLocationConf(locConf)
 	}
 
 	return

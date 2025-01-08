@@ -2,7 +2,10 @@ package mount
 
 import (
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"net/http"
+	"syscall"
+	"time"
 )
 
 /**
@@ -33,15 +36,23 @@ import (
  */
 func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (written uint32, code fuse.Status) {
 
+	if wfs.IsOverQuota {
+		return 0, fuse.Status(syscall.ENOSPC)
+	}
+
 	fh := wfs.GetHandle(FileHandleId(in.Fh))
 	if fh == nil {
 		return 0, fuse.ENOENT
 	}
 
-	fh.Lock()
-	defer fh.Unlock()
+	fh.dirtyPages.writerPattern.MonitorWriteAt(int64(in.Offset), int(in.Size))
 
-	entry := fh.entry
+	tsNs := time.Now().UnixNano()
+
+	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("Write", fh.fh, util.ExclusiveLock)
+	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
+	entry := fh.GetEntry()
 	if entry == nil {
 		return 0, fuse.OK
 	}
@@ -51,7 +62,7 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 	entry.Attributes.FileSize = uint64(max(offset+int64(len(data)), int64(entry.Attributes.FileSize)))
 	// glog.V(4).Infof("%v write [%d,%d) %d", fh.f.fullpath(), req.Offset, req.Offset+int64(len(req.Data)), len(req.Data))
 
-	fh.dirtyPages.AddPage(offset, data)
+	fh.dirtyPages.AddPage(offset, data, fh.dirtyPages.writerPattern.IsSequentialMode(), tsNs)
 
 	written = uint32(len(data))
 
@@ -61,6 +72,11 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 	}
 
 	fh.dirtyMetadata = true
+
+	if IsDebugFileReadWrite {
+		// print("+")
+		fh.mirrorFile.WriteAt(data, offset)
+	}
 
 	return written, fuse.OK
 }
