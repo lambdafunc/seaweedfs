@@ -1,15 +1,16 @@
 package mount
 
 import (
-	"github.com/chrislusf/seaweedfs/weed/filesys/page_writer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/mount/page_writer"
 )
 
 type PageWriter struct {
-	fh          *FileHandle
-	collection  string
-	replication string
-	chunkSize   int64
+	fh            *FileHandle
+	collection    string
+	replication   string
+	chunkSize     int64
+	writerPattern *WriterPattern
 
 	randomWriter page_writer.DirtyPages
 }
@@ -20,53 +21,49 @@ var (
 
 func newPageWriter(fh *FileHandle, chunkSize int64) *PageWriter {
 	pw := &PageWriter{
-		fh:           fh,
-		chunkSize:    chunkSize,
-		randomWriter: newMemoryChunkPages(fh, chunkSize),
-		// randomWriter: newTempFileDirtyPages(fh.f, chunkSize),
+		fh:            fh,
+		chunkSize:     chunkSize,
+		writerPattern: NewWriterPattern(chunkSize),
+		randomWriter:  newMemoryChunkPages(fh, chunkSize),
 	}
 	return pw
 }
 
-func (pw *PageWriter) AddPage(offset int64, data []byte) {
+func (pw *PageWriter) AddPage(offset int64, data []byte, isSequential bool, tsNs int64) {
 
 	glog.V(4).Infof("%v AddPage [%d, %d)", pw.fh.fh, offset, offset+int64(len(data)))
 
 	chunkIndex := offset / pw.chunkSize
 	for i := chunkIndex; len(data) > 0; i++ {
 		writeSize := min(int64(len(data)), (i+1)*pw.chunkSize-offset)
-		pw.addToOneChunk(i, offset, data[:writeSize])
+		pw.addToOneChunk(i, offset, data[:writeSize], isSequential, tsNs)
 		offset += writeSize
 		data = data[writeSize:]
 	}
 }
 
-func (pw *PageWriter) addToOneChunk(chunkIndex, offset int64, data []byte) {
-	pw.randomWriter.AddPage(offset, data)
+func (pw *PageWriter) addToOneChunk(chunkIndex, offset int64, data []byte, isSequential bool, tsNs int64) {
+	pw.randomWriter.AddPage(offset, data, isSequential, tsNs)
 }
 
 func (pw *PageWriter) FlushData() error {
 	return pw.randomWriter.FlushData()
 }
 
-func (pw *PageWriter) ReadDirtyDataAt(data []byte, offset int64) (maxStop int64) {
-	glog.V(4).Infof("ReadDirtyDataAt %v [%d, %d)", pw.fh.fh, offset, offset+int64(len(data)))
+func (pw *PageWriter) ReadDirtyDataAt(data []byte, offset int64, tsNs int64) (maxStop int64) {
+	glog.V(4).Infof("ReadDirtyDataAt %v [%d, %d)", pw.fh.inode, offset, offset+int64(len(data)))
 
 	chunkIndex := offset / pw.chunkSize
 	for i := chunkIndex; len(data) > 0; i++ {
 		readSize := min(int64(len(data)), (i+1)*pw.chunkSize-offset)
 
-		maxStop = pw.randomWriter.ReadDirtyDataAt(data[:readSize], offset)
+		maxStop = pw.randomWriter.ReadDirtyDataAt(data[:readSize], offset, tsNs)
 
 		offset += readSize
 		data = data[readSize:]
 	}
 
 	return
-}
-
-func (pw *PageWriter) GetStorageOptions() (collection, replication string) {
-	return pw.randomWriter.GetStorageOptions()
 }
 
 func (pw *PageWriter) LockForRead(startOffset, stopOffset int64) {

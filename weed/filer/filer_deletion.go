@@ -4,10 +4,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/wdclient"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
 func LookupByMasterClientFn(masterClient *wdclient.MasterClient) func(vids []string) (map[string]*operation.LookupResult, error) {
@@ -20,6 +23,7 @@ func LookupByMasterClientFn(masterClient *wdclient.MasterClient) func(vids []str
 				locations = append(locations, operation.Location{
 					Url:       loc.Url,
 					PublicUrl: loc.PublicUrl,
+					GrpcPort:  loc.GrpcPort,
 				})
 			}
 			m[vid] = &operation.LookupResult{
@@ -51,13 +55,13 @@ func (f *Filer) loopProcessingDeletion() {
 					fileIds = fileIds[:0]
 				}
 				deletionCount = len(toDeleteFileIds)
-				_, err := operation.DeleteFilesWithLookupVolumeId(f.GrpcDialOption, toDeleteFileIds, lookupFunc)
+				_, err := operation.DeleteFileIdsWithLookupVolumeId(f.GrpcDialOption, toDeleteFileIds, lookupFunc)
 				if err != nil {
-					if !strings.Contains(err.Error(), "already deleted") {
+					if !strings.Contains(err.Error(), storage.ErrorDeleted.Error()) {
 						glog.V(0).Infof("deleting fileIds len=%d error: %v", deletionCount, err)
 					}
 				} else {
-					glog.V(1).Infof("deleting fileIds len=%d", deletionCount)
+					glog.V(2).Infof("deleting fileIds %+v", toDeleteFileIds)
 				}
 			}
 		})
@@ -68,51 +72,19 @@ func (f *Filer) loopProcessingDeletion() {
 	}
 }
 
-func (f *Filer) doDeleteFileIds(fileIds []string) {
-
-	lookupFunc := LookupByMasterClientFn(f.MasterClient)
-	DeletionBatchSize := 100000 // roughly 20 bytes cost per file id.
-
-	for len(fileIds) > 0 {
-		var toDeleteFileIds []string
-		if len(fileIds) > DeletionBatchSize {
-			toDeleteFileIds = fileIds[:DeletionBatchSize]
-			fileIds = fileIds[DeletionBatchSize:]
-		} else {
-			toDeleteFileIds = fileIds
-			fileIds = fileIds[:0]
-		}
-		deletionCount := len(toDeleteFileIds)
-		_, err := operation.DeleteFilesWithLookupVolumeId(f.GrpcDialOption, toDeleteFileIds, lookupFunc)
-		if err != nil {
-			if !strings.Contains(err.Error(), "already deleted") {
-				glog.V(0).Infof("deleting fileIds len=%d error: %v", deletionCount, err)
-			}
-		}
-	}
+func (f *Filer) DeleteUncommittedChunks(chunks []*filer_pb.FileChunk) {
+	f.doDeleteChunks(chunks)
 }
 
-func (f *Filer) DirectDeleteChunks(chunks []*filer_pb.FileChunk) {
-	var fildIdsToDelete []string
-	for _, chunk := range chunks {
-		if !chunk.IsChunkManifest {
-			fildIdsToDelete = append(fildIdsToDelete, chunk.GetFileIdString())
-			continue
-		}
-		dataChunks, manifestResolveErr := ResolveOneChunkManifest(f.MasterClient.LookupFileId, chunk)
-		if manifestResolveErr != nil {
-			glog.V(0).Infof("failed to resolve manifest %s: %v", chunk.FileId, manifestResolveErr)
-		}
-		for _, dChunk := range dataChunks {
-			fildIdsToDelete = append(fildIdsToDelete, dChunk.GetFileIdString())
-		}
-		fildIdsToDelete = append(fildIdsToDelete, chunk.GetFileIdString())
+func (f *Filer) DeleteChunks(fullpath util.FullPath, chunks []*filer_pb.FileChunk) {
+	rule := f.FilerConf.MatchStorageRule(string(fullpath))
+	if rule.DisableChunkDeletion {
+		return
 	}
-
-	f.doDeleteFileIds(fildIdsToDelete)
+	f.doDeleteChunks(chunks)
 }
 
-func (f *Filer) DeleteChunks(chunks []*filer_pb.FileChunk) {
+func (f *Filer) doDeleteChunks(chunks []*filer_pb.FileChunk) {
 	for _, chunk := range chunks {
 		if !chunk.IsChunkManifest {
 			f.fileIdDeletionQueue.EnQueue(chunk.GetFileIdString())
@@ -129,26 +101,25 @@ func (f *Filer) DeleteChunks(chunks []*filer_pb.FileChunk) {
 	}
 }
 
+func (f *Filer) DeleteChunksNotRecursive(chunks []*filer_pb.FileChunk) {
+	for _, chunk := range chunks {
+		f.fileIdDeletionQueue.EnQueue(chunk.GetFileIdString())
+	}
+}
+
 func (f *Filer) deleteChunksIfNotNew(oldEntry, newEntry *Entry) {
+	var oldChunks, newChunks []*filer_pb.FileChunk
+	if oldEntry != nil {
+		oldChunks = oldEntry.GetChunks()
+	}
+	if newEntry != nil {
+		newChunks = newEntry.GetChunks()
+	}
 
-	if oldEntry == nil {
+	toDelete, err := MinusChunks(f.MasterClient.GetLookupFileIdFunction(), oldChunks, newChunks)
+	if err != nil {
+		glog.Errorf("Failed to resolve old entry chunks when delete old entry chunks. new: %s, old: %s", newChunks, oldChunks)
 		return
 	}
-	if newEntry == nil {
-		f.DeleteChunks(oldEntry.Chunks)
-		return
-	}
-
-	var toDelete []*filer_pb.FileChunk
-	newChunkIds := make(map[string]bool)
-	for _, newChunk := range newEntry.Chunks {
-		newChunkIds[newChunk.GetFileIdString()] = true
-	}
-
-	for _, oldChunk := range oldEntry.Chunks {
-		if _, found := newChunkIds[oldChunk.GetFileIdString()]; !found {
-			toDelete = append(toDelete, oldChunk)
-		}
-	}
-	f.DeleteChunks(toDelete)
+	f.DeleteChunksNotRecursive(toDelete)
 }

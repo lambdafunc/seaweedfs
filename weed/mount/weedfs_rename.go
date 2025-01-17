@@ -3,15 +3,16 @@ package mount
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/hanwen/go-fuse/v2/fs"
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"io"
 	"strings"
 	"syscall"
+
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 /** Rename a file
@@ -131,6 +132,10 @@ const (
 )
 
 func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string, newName string) (code fuse.Status) {
+	if wfs.IsOverQuota {
+		return fuse.Status(syscall.ENOSPC)
+	}
+
 	if s := checkName(newName); s != fuse.OK {
 		return s
 	}
@@ -145,10 +150,25 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 		return fuse.EINVAL
 	}
 
-	oldDir := wfs.inodeToPath.GetPath(in.NodeId)
+	oldDir, code := wfs.inodeToPath.GetPath(in.NodeId)
+	if code != fuse.OK {
+		return
+	}
 	oldPath := oldDir.Child(oldName)
-	newDir := wfs.inodeToPath.GetPath(in.Newdir)
+	newDir, code := wfs.inodeToPath.GetPath(in.Newdir)
+	if code != fuse.OK {
+		return
+	}
 	newPath := newDir.Child(newName)
+
+	oldEntry, status := wfs.maybeLoadEntry(oldPath)
+	if status != fuse.OK {
+		return status
+	}
+
+	if wormEnforced, _ := wfs.wormEnforcedForEntry(oldPath, oldEntry); wormEnforced {
+		return fuse.EPERM
+	}
 
 	glog.V(4).Infof("dir Rename %s => %s", oldPath, newPath)
 
@@ -208,6 +228,8 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 func (wfs *WFS) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamRenameEntryResponse) error {
 	// comes from filer StreamRenameEntry, can only be create or delete entry
 
+	glog.V(4).Infof("dir Rename %+v", resp.EventNotification)
+
 	if resp.EventNotification.NewEntry != nil {
 		// with new entry, the old entry name also exists. This is the first step to create new entry
 		newEntry := filer.FromPbEntry(resp.EventNotification.NewParentPath, resp.EventNotification.NewEntry)
@@ -221,7 +243,21 @@ func (wfs *WFS) handleRenameResponse(ctx context.Context, resp *filer_pb.StreamR
 		oldPath := oldParent.Child(oldName)
 		newPath := newParent.Child(newName)
 
-		wfs.inodeToPath.MovePath(oldPath, newPath)
+		sourceInode, targetInode := wfs.inodeToPath.MovePath(oldPath, newPath)
+		if sourceInode != 0 {
+			fh, foundFh := wfs.fhMap.FindFileHandle(sourceInode)
+			if foundFh {
+				if entry := fh.GetEntry(); entry != nil {
+					entry.Name = newName
+				}
+			}
+			// invalidate attr and data
+			// wfs.fuseServer.InodeNotify(sourceInode, 0, -1)
+		}
+		if targetInode != 0 {
+			// invalidate attr and data
+			// wfs.fuseServer.InodeNotify(targetInode, 0, -1)
+		}
 
 	} else if resp.EventNotification.OldEntry != nil {
 		// without new entry, only old entry name exists. This is the second step to delete old entry

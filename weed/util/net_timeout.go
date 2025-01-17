@@ -1,10 +1,11 @@
 package util
 
 import (
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"net"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 )
 
 // Listener wraps a net.Listener, and gives a place to store the timeout
@@ -82,16 +83,46 @@ func (c *Conn) Close() error {
 	return err
 }
 
-func NewListener(addr string, timeout time.Duration) (net.Listener, error) {
-	l, err := net.Listen("tcp", addr)
+func NewListener(addr string, timeout time.Duration) (ipListener net.Listener, err error) {
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, err
+		return
 	}
 
-	tl := &Listener{
-		Listener:     l,
+	ipListener = &Listener{
+		Listener:     listener,
 		ReadTimeout:  timeout,
 		WriteTimeout: timeout,
 	}
-	return tl, nil
+
+	return
+}
+
+func NewIpAndLocalListeners(host string, port int, timeout time.Duration) (ipListener net.Listener, localListener net.Listener, err error) {
+	listener, err := net.Listen("tcp", JoinHostPort(host, port))
+	if err != nil {
+		return
+	}
+
+	ipListener = &Listener{
+		Listener:     listener,
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
+	}
+
+	if host != "localhost" && host != "" && host != "0.0.0.0" && host != "127.0.0.1" && host != "[::]" && host != "[::1]" {
+		listener, err = net.Listen("tcp", JoinHostPort("localhost", port))
+		if err != nil {
+			glog.V(0).Infof("skip starting on %s:%d: %v", host, port, err)
+			return ipListener, nil, nil
+		}
+
+		localListener = &Listener{
+			Listener:     listener,
+			ReadTimeout:  timeout,
+			WriteTimeout: timeout,
+		}
+	}
+
+	return
 }

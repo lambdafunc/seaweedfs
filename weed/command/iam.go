@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/iamapi"
-	"github.com/chrislusf/seaweedfs/weed/pb"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/security"
-	"github.com/chrislusf/seaweedfs/weed/util"
-	"github.com/gorilla/mux"
 	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/iamapi"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 var (
@@ -22,6 +23,7 @@ var (
 type IamOptions struct {
 	filer   *string
 	masters *string
+	ip      *string
 	port    *int
 }
 
@@ -29,11 +31,12 @@ func init() {
 	cmdIam.Run = runIam // break init cycle
 	iamStandaloneOptions.filer = cmdIam.Flag.String("filer", "localhost:8888", "filer server address")
 	iamStandaloneOptions.masters = cmdIam.Flag.String("master", "localhost:9333", "comma-separated master servers")
+	iamStandaloneOptions.ip = cmdIam.Flag.String("ip", util.DetectedHostAddress(), "iam server http listen ip address")
 	iamStandaloneOptions.port = cmdIam.Flag.Int("port", 8111, "iam server http listen port")
 }
 
 var cmdIam = &Command{
-	UsageLine: "iam [-port=8111] [-filer=<ip:port>] [-masters=<ip:port>,<ip:port>]",
+	UsageLine: "iam [-port=8111] [-filer=<ip:port>] [-master=<ip:port>,<ip:port>]",
 	Short:     "start a iam API compatible server",
 	Long:      "start a iam API compatible server.",
 }
@@ -45,10 +48,10 @@ func runIam(cmd *Command, args []string) bool {
 func (iamopt *IamOptions) startIamServer() bool {
 	filerAddress := pb.ServerAddress(*iamopt.filer)
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 	for {
-		err := pb.WithGrpcFilerClient(false, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		err := pb.WithGrpcFilerClient(false, 0, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
 			if err != nil {
 				return fmt.Errorf("get filer %s configuration: %v", filerAddress, err)
@@ -65,7 +68,7 @@ func (iamopt *IamOptions) startIamServer() bool {
 		}
 	}
 
-	masters := pb.ServerAddresses(*iamopt.masters).ToAddresses()
+	masters := pb.ServerAddresses(*iamopt.masters).ToAddressMap()
 	router := mux.NewRouter().SkipClean(true)
 	_, iamApiServer_err := iamapi.NewIamApiServer(router, &iamapi.IamServerOption{
 		Masters:        masters,
@@ -81,12 +84,19 @@ func (iamopt *IamOptions) startIamServer() bool {
 	httpS := &http.Server{Handler: router}
 
 	listenAddress := fmt.Sprintf(":%d", *iamopt.port)
-	iamApiListener, err := util.NewListener(listenAddress, time.Duration(10)*time.Second)
+	iamApiListener, iamApiLocalListener, err := util.NewIpAndLocalListeners(*iamopt.ip, *iamopt.port, time.Duration(10)*time.Second)
 	if err != nil {
 		glog.Fatalf("IAM API Server listener on %s error: %v", listenAddress, err)
 	}
 
 	glog.V(0).Infof("Start Seaweed IAM API Server %s at http port %d", util.Version(), *iamopt.port)
+	if iamApiLocalListener != nil {
+		go func() {
+			if err = httpS.Serve(iamApiLocalListener); err != nil {
+				glog.Errorf("IAM API Server Fail to serve: %v", err)
+			}
+		}()
+	}
 	if err = httpS.Serve(iamApiListener); err != nil {
 		glog.Fatalf("IAM API Server Fail to serve: %v", err)
 	}

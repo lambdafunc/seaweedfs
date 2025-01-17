@@ -3,14 +3,16 @@ package mount
 import (
 	"context"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"os"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 /** Create a directory
@@ -20,6 +22,10 @@ import (
  * correct directory type bits use  mode|S_IFDIR
  * */
 func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out *fuse.EntryOut) (code fuse.Status) {
+
+	if wfs.IsOverQuota {
+		return fuse.Status(syscall.ENOSPC)
+	}
 
 	if s := checkName(name); s != fuse.OK {
 		return s
@@ -37,7 +43,10 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 		},
 	}
 
-	dirFullPath := wfs.inodeToPath.GetPath(in.NodeId)
+	dirFullPath, code := wfs.inodeToPath.GetPath(in.NodeId)
+	if code != fuse.OK {
+		return
+	}
 
 	entryFullPath := dirFullPath.Child(name)
 
@@ -47,9 +56,10 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 		defer wfs.mapPbIdFromFilerToLocal(newEntry)
 
 		request := &filer_pb.CreateEntryRequest{
-			Directory:  string(dirFullPath),
-			Entry:      newEntry,
-			Signatures: []int32{wfs.signature},
+			Directory:                string(dirFullPath),
+			Entry:                    newEntry,
+			Signatures:               []int32{wfs.signature},
+			SkipCheckParentDirectory: true,
 		}
 
 		glog.V(1).Infof("mkdir: %v", request)
@@ -71,7 +81,7 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 		return fuse.EIO
 	}
 
-	inode := wfs.inodeToPath.Lookup(entryFullPath, true, true)
+	inode := wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, true, false, 0, true)
 
 	wfs.outputPbEntry(out, inode, newEntry)
 
@@ -89,12 +99,15 @@ func (wfs *WFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string
 		return fuse.Status(syscall.ENOTEMPTY)
 	}
 
-	dirFullPath := wfs.inodeToPath.GetPath(header.NodeId)
+	dirFullPath, code := wfs.inodeToPath.GetPath(header.NodeId)
+	if code != fuse.OK {
+		return
+	}
 	entryFullPath := dirFullPath.Child(name)
 
 	glog.V(3).Infof("remove directory: %v", entryFullPath)
 	ignoreRecursiveErr := true // ignore recursion error since the OS should manage it
-	err := filer_pb.Remove(wfs, string(dirFullPath), name, true, true, ignoreRecursiveErr, false, []int32{wfs.signature})
+	err := filer_pb.Remove(wfs, string(dirFullPath), name, true, false, ignoreRecursiveErr, false, []int32{wfs.signature})
 	if err != nil {
 		glog.V(0).Infof("remove %s: %v", entryFullPath, err)
 		if strings.Contains(err.Error(), filer.MsgFailDelNonEmptyFolder) {
